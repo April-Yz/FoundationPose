@@ -91,6 +91,9 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--track_refine_iter", type=int, default=2)
   parser.add_argument("--debug", type=int, default=1)
   parser.add_argument("--save_video", type=int, default=1, help="Whether to save the rendered visualization video")
+  parser.add_argument("--save_mesh_overlay_video", type=int, default=0, help="Whether to save a mesh overlay video")
+  parser.add_argument("--save_bbox_overlay_video", type=int, default=0, help="Whether to save a projected 2D bbox video")
+  parser.add_argument("--mesh_overlay_alpha", type=float, default=0.45, help="Blend ratio for the rendered mesh overlay")
   return parser.parse_args()
 
 
@@ -458,6 +461,81 @@ def make_video_writer(output_path: Path, fps: float, width: int, height: int) ->
   return writer
 
 
+def project_mesh_bbox_xyxy(mesh_vertices: np.ndarray, ob_in_cam: np.ndarray, K: np.ndarray, width: int, height: int) -> Optional[np.ndarray]:
+  verts = np.asarray(mesh_vertices, dtype=np.float32)
+  pose = np.asarray(ob_in_cam, dtype=np.float32).reshape(4, 4)
+  verts_h = np.concatenate([verts, np.ones((len(verts), 1), dtype=np.float32)], axis=1)
+  verts_cam = (pose @ verts_h.T).T[:, :3]
+  valid = verts_cam[:, 2] > 1e-4
+  if valid.sum() < 8:
+    return None
+  projected = (K @ verts_cam[valid].T).T
+  uv = projected[:, :2] / projected[:, 2:3]
+  uv = uv[np.isfinite(uv).all(axis=1)]
+  if len(uv) == 0:
+    return None
+  x1 = int(np.floor(np.clip(uv[:, 0].min(), 0, width - 1)))
+  y1 = int(np.floor(np.clip(uv[:, 1].min(), 0, height - 1)))
+  x2 = int(np.ceil(np.clip(uv[:, 0].max(), x1 + 1, width)))
+  y2 = int(np.ceil(np.clip(uv[:, 1].max(), y1 + 1, height)))
+  return np.array([x1, y1, x2, y2], dtype=np.int32)
+
+
+def make_bbox_overlay_frame(
+  rgb: np.ndarray,
+  ob_in_cam: np.ndarray,
+  K: np.ndarray,
+  mesh_vertices: np.ndarray,
+  prompt: str,
+  line_color: Tuple[int, int, int] = (0, 255, 255),
+) -> np.ndarray:
+  vis = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
+  bbox_xyxy = project_mesh_bbox_xyxy(mesh_vertices=mesh_vertices, ob_in_cam=ob_in_cam, K=K, width=rgb.shape[1], height=rgb.shape[0])
+  if bbox_xyxy is not None:
+    x1, y1, x2, y2 = bbox_xyxy.tolist()
+    cv2.rectangle(vis, (x1, y1), (x2, y2), line_color, 2)
+    cv2.putText(
+      vis,
+      prompt,
+      (x1, max(20, y1 - 8)),
+      cv2.FONT_HERSHEY_SIMPLEX,
+      0.7,
+      line_color,
+      2,
+      cv2.LINE_AA,
+    )
+  return vis
+
+
+def make_mesh_overlay_frame(
+  rgb: np.ndarray,
+  ob_in_cam: np.ndarray,
+  K: np.ndarray,
+  glctx,
+  mesh_tensors: Dict[str, torch.Tensor],
+  alpha: float,
+) -> np.ndarray:
+  alpha = float(np.clip(alpha, 0.0, 1.0))
+  ob_in_cam_t = torch.as_tensor(ob_in_cam.reshape(1, 4, 4), device="cuda", dtype=torch.float)
+  color, depth, _ = nvdiffrast_render(
+    K=K,
+    H=rgb.shape[0],
+    W=rgb.shape[1],
+    ob_in_cams=ob_in_cam_t,
+    glctx=glctx,
+    context="cuda",
+    mesh_tensors=mesh_tensors,
+    output_size=(rgb.shape[0], rgb.shape[1]),
+    use_light=True,
+  )
+  mesh_rgb = (color[0].detach().float().cpu().numpy().clip(0, 1) * 255.0).astype(np.uint8)
+  mesh_mask = depth[0].detach().float().cpu().numpy() > 0
+  vis = rgb.copy()
+  if mesh_mask.any():
+    vis[mesh_mask] = ((1.0 - alpha) * vis[mesh_mask] + alpha * mesh_rgb[mesh_mask]).astype(np.uint8)
+  return cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+
+
 def main() -> None:
   args = parse_args()
   set_logging_format()
@@ -527,7 +605,9 @@ def main() -> None:
     glctx=glctx,
   )
 
-  video_writer: Optional[cv2.VideoWriter] = None
+  pose_video_writer: Optional[cv2.VideoWriter] = None
+  mesh_overlay_writer: Optional[cv2.VideoWriter] = None
+  bbox_overlay_writer: Optional[cv2.VideoWriter] = None
   pose_list: List[np.ndarray] = []
   frame_indices: List[int] = []
 
@@ -606,14 +686,53 @@ def main() -> None:
       vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
 
     if args.save_video:
-      if video_writer is None:
-        video_writer = make_video_writer(output_dir / "pose_vis.mp4", fps=fps, width=vis_bgr.shape[1], height=vis_bgr.shape[0])
-      video_writer.write(vis_bgr)
+      if pose_video_writer is None:
+        pose_video_writer = make_video_writer(output_dir / "pose_vis.mp4", fps=fps, width=vis_bgr.shape[1], height=vis_bgr.shape[0])
+      pose_video_writer.write(vis_bgr)
+
+    if args.save_mesh_overlay_video:
+      mesh_overlay_bgr = make_mesh_overlay_frame(
+        rgb=rgb,
+        ob_in_cam=pose,
+        K=K,
+        glctx=estimator.glctx,
+        mesh_tensors=estimator.mesh_tensors,
+        alpha=args.mesh_overlay_alpha,
+      )
+      if mesh_overlay_writer is None:
+        mesh_overlay_writer = make_video_writer(
+          output_dir / "mesh_overlay.mp4",
+          fps=fps,
+          width=mesh_overlay_bgr.shape[1],
+          height=mesh_overlay_bgr.shape[0],
+        )
+      mesh_overlay_writer.write(mesh_overlay_bgr)
+
+    if args.save_bbox_overlay_video:
+      bbox_overlay_bgr = make_bbox_overlay_frame(
+        rgb=rgb,
+        ob_in_cam=pose,
+        K=K,
+        mesh_vertices=np.asarray(estimator.mesh.vertices),
+        prompt=args.prompt,
+      )
+      if bbox_overlay_writer is None:
+        bbox_overlay_writer = make_video_writer(
+          output_dir / "bbox_overlay.mp4",
+          fps=fps,
+          width=bbox_overlay_bgr.shape[1],
+          height=bbox_overlay_bgr.shape[0],
+        )
+      bbox_overlay_writer.write(bbox_overlay_bgr)
 
   rgb_cap.release()
   depth_source.release()
-  if video_writer is not None:
-    video_writer.release()
+  if pose_video_writer is not None:
+    pose_video_writer.release()
+  if mesh_overlay_writer is not None:
+    mesh_overlay_writer.release()
+  if bbox_overlay_writer is not None:
+    bbox_overlay_writer.release()
 
   if not pose_list:
     raise RuntimeError("No poses were produced.")
@@ -642,6 +761,10 @@ def main() -> None:
     "sam_checkpoint": str(Path(args.sam_checkpoint).resolve()),
     "depth_scale": depth_scale,
     "max_depth_m": args.max_depth_m,
+    "save_video": bool(args.save_video),
+    "save_mesh_overlay_video": bool(args.save_mesh_overlay_video),
+    "save_bbox_overlay_video": bool(args.save_bbox_overlay_video),
+    "mesh_overlay_alpha": args.mesh_overlay_alpha,
     "camera": camera_meta,
     "num_output_frames": len(frame_indices),
     "first_output_frame": frame_indices[0],

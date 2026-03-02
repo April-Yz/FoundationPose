@@ -101,4 +101,6 @@ python /projects/zaijia001/FoundationPose/run_realr1_dino_sam.py \
   --video_id 1 \
   --mesh_file /projects/_hdd/zaijia/R1/obj_mesh/bottle.obj \
   --output_dir /projects/zaijia001/R1/object_pose/d_pour_low_bottle_1 \
-  --prompt bottle
+  --prompt bottle \
+  --save_mesh_overlay_video 1 \
+  --save_bbox_overlay_video 1
