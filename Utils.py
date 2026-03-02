@@ -103,8 +103,12 @@ set_logging_format()
 
 def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
   mesh_tensors = {}
+  tex_image = None
   if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
-    img = np.array(mesh.visual.material.image.convert('RGB'))
+    tex_image = getattr(getattr(mesh.visual, 'material', None), 'image', None)
+
+  if tex_image is not None:
+    img = np.array(tex_image.convert('RGB'))
     img = img[...,:3]
     if max_tex_size is not None:
       max_size = max(img.shape[0], img.shape[1])
@@ -117,10 +121,13 @@ def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
     uv[:,1] = 1 - uv[:,1]
     mesh_tensors['uv']  = uv
   else:
-    if mesh.visual.vertex_colors is None:
+    if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
+      logging.info("WARN: mesh has texture UVs but no texture image, assigning a pure color")
+    vertex_colors = getattr(mesh.visual, 'vertex_colors', None)
+    if vertex_colors is None:
       logging.info(f"WARN: mesh doesn't have vertex_colors, assigning a pure color")
-      mesh.visual.vertex_colors = np.tile(np.array([128,128,128]).reshape(1,3), (len(mesh.vertices), 1))
-    mesh_tensors['vertex_color'] = torch.as_tensor(mesh.visual.vertex_colors[...,:3], device=device, dtype=torch.float)/255.0
+      vertex_colors = np.tile(np.array([128,128,128], dtype=np.uint8).reshape(1,3), (len(mesh.vertices), 1))
+    mesh_tensors['vertex_color'] = torch.as_tensor(vertex_colors[...,:3], device=device, dtype=torch.float)/255.0
 
   mesh_tensors.update({
     'pos': torch.tensor(mesh.vertices, device=device, dtype=torch.float),
@@ -581,6 +588,10 @@ def compute_crop_window_tf_batch(pts=None, H=None, W=None, poses=None, K=None, c
   @min_box: min_box/min_circle
   @scale: scale to apply to the tightly enclosing roi
   '''
+  device = poses.device if torch.is_tensor(poses) else 'cuda'
+  poses = torch.as_tensor(poses, device=device, dtype=torch.float)
+  K = torch.as_tensor(K, device=device, dtype=torch.float)
+
   def compute_tf_batch(left, right, top, bottom):
     B = len(left)
     left = left.round()
@@ -588,10 +599,10 @@ def compute_crop_window_tf_batch(pts=None, H=None, W=None, poses=None, K=None, c
     top = top.round()
     bottom = bottom.round()
 
-    tf = torch.eye(3)[None].expand(B,-1,-1).contiguous()
+    tf = torch.eye(3, device=device, dtype=torch.float)[None].expand(B,-1,-1).contiguous()
     tf[:,0,2] = -left
     tf[:,1,2] = -top
-    new_tf = torch.eye(3)[None].expand(B,-1,-1).contiguous()
+    new_tf = torch.eye(3, device=device, dtype=torch.float)[None].expand(B,-1,-1).contiguous()
     new_tf[:,0,0] = out_size[0]/(right-left)
     new_tf[:,1,1] = out_size[1]/(bottom-top)
     tf = new_tf@tf
@@ -605,9 +616,8 @@ def compute_crop_window_tf_batch(pts=None, H=None, W=None, poses=None, K=None, c
                         radius,0,0,
                         -radius,0,0,
                         0,radius,0,
-                        0,-radius,0]).reshape(-1,3)
+                        0,-radius,0], device=device, dtype=torch.float).reshape(-1,3)
     pts = poses[:,:3,3].reshape(-1,1,3)+offsets.reshape(1,-1,3)
-    K = torch.as_tensor(K)
     projected = (K@pts.reshape(-1,3).T).T
     uvs = projected[:,:2]/projected[:,2:3]
     uvs = uvs.reshape(B, -1, 2)
