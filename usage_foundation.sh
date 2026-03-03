@@ -104,3 +104,16 @@ python /projects/zaijia001/FoundationPose/run_realr1_dino_sam.py \
   --prompt bottle \
   --save_mesh_overlay_video 1 \
   --save_bbox_overlay_video 1
+
+# 批处理整个文件夹:
+python /projects/zaijia001/FoundationPose/run_realr1_dino_sam_batch.py \
+  --data_dir /projects/zaijia001/R1/hand/d_pour_low \
+  --mesh_file /projects/_hdd/zaijia/R1/obj_mesh/bottle.obj \
+  --output_root /projects/zaijia001/R1/object_pose \
+  --prompt bottle \
+  --save_video 1 \
+  --save_mesh_overlay_video 1 \
+  --save_bbox_overlay_video 1
+
+# DINO / SAM2 环境说明见:
+# /projects/zaijia001/FoundationPose/README_DINO_SAM_ENV.md
